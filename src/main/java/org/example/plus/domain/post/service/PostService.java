@@ -1,6 +1,8 @@
 package org.example.plus.domain.post.service;
 
+import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 import java.util.stream.Collectors;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -8,18 +10,23 @@ import org.example.plus.common.entity.Post;
 import org.example.plus.common.entity.User;
 import org.example.plus.domain.post.model.dto.PostDto;
 import org.example.plus.domain.post.model.dto.PostSummaryDto;
+import org.example.plus.domain.post.model.request.UpdatePostRequest;
 import org.example.plus.domain.post.repository.PostRepository;
 import org.example.plus.domain.user.repository.UserRepository;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 @Service
 @Slf4j
 @RequiredArgsConstructor
+@Transactional(readOnly = true)
 public class PostService {
 
     private final PostRepository postRepository;
     private final UserRepository userRepository;
+    private final PostCacheService postCacheService;
 
+    @Transactional
     public PostDto creatPost(String username, String content) {
 
         User user = userRepository.findUserByUsername(username).orElseThrow(
@@ -59,6 +66,65 @@ public class PostService {
 
         List<PostSummaryDto> result = postRepository.findPostSummary(username);
         return result;
+    }
+
+    public PostDto getPostById(Long postId) {
+        PostDto postCache = postCacheService.getPostCache(postId);
+
+        if (postCache != null) {
+            log.info("[Redis Cache HIT] postId: {}", postId);
+
+            // 조회된 Post 조회수 증가
+            postCacheService.increaseViewCount(postId);
+
+            return postCache;
+        }
+
+        log.info("[Redis Cache MISS] postId: {}", postId);
+
+        Post post = postRepository.findById(postId)
+                .orElseThrow(() -> new IllegalArgumentException("Post가 없습니다."));
+
+        // 조회된 Post 조회수 증가
+        postCacheService.increaseViewCount(postId);
+
+        PostDto postDto = PostDto.from(post);
+
+        // redis에 저장
+        postCacheService.savePostCache(postId, postDto);
+
+        return postDto;
+    }
+
+    @Transactional
+    public PostDto updatePostById(Long postId, UpdatePostRequest request) {
+        Post post = postRepository.findById(postId)
+                .orElseThrow(() -> new IllegalArgumentException("Post가 없습니다."));
+
+        post.update(request);
+
+        postRepository.save(post);
+
+        // 캐시 삭제
+        postCacheService.deletePostCache(postId);
+
+        return PostDto.from(post);
+    }
+
+    public List<PostDto> getTopPostList(int limit) {
+        List<Long> topPostIdList = postCacheService.getTopPostList(limit);
+
+        if (topPostIdList.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        List<PostDto> postDtoList = topPostIdList.stream()
+                .map(postId -> Optional.ofNullable(postCacheService.getPostCache(postId))
+                        .orElseGet(() -> PostDto.from(postRepository.findById(postId)
+                                .orElseThrow(() -> new IllegalArgumentException("Post가 없습니다.")))))
+                .toList();
+
+        return postDtoList;
     }
 }
 
